@@ -1,3 +1,4 @@
+// frontend/src/App.js
 import React, { useEffect, useState } from "react";
 import {
   fetchUsers,
@@ -6,13 +7,9 @@ import {
   deleteUser,
 } from "./api";
 
-const emptyForm = {
-  full_name: "",
-  email: "",
-  is_active: true,
-};
+const emptyForm = { full_name: "", email: "", is_active: true };
 
-function App() {
+export default function App() {
   const [users, setUsers] = useState([]);
   const [form, setForm] = useState(emptyForm);
   const [editingId, setEditingId] = useState(null);
@@ -52,26 +49,8 @@ function App() {
     }
   };
 
-  const handleEdit = (u) => {
-    setEditingId(u.id);
-    setForm({
-      full_name: u.full_name,
-      email: u.email,
-      is_active: u.is_active,
-    });
-  };
-
-  const handleDelete = async (id) => {
-    try {
-      await deleteUser(id);
-      load();
-    } catch (e) {
-      setErr(e.message);
-    }
-  };
-
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen bg-slate-100">
       <header className="bg-white shadow">
         <div className="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
           <h1 className="text-xl font-bold text-slate-800">User Admin</h1>
@@ -79,9 +58,9 @@ function App() {
         </div>
       </header>
 
-      <main className="max-w-6xl mx-auto px-4 py-6 flex gap-6">
-        {/* Form */}
-        <div className="w-1/3">
+      <main className="max-w-6xl mx-auto px-4 py-6 flex gap-6 flex-col md:flex-row">
+        {/* form */}
+        <div className="w-full md:w-1/3">
           <div className="bg-white rounded-xl shadow p-4">
             <h2 className="text-lg font-semibold mb-4">
               {editingId ? "Edit user" : "Create user"}
@@ -134,8 +113,8 @@ function App() {
           </div>
         </div>
 
-        {/* Table */}
-        <div className="w-2/3">
+        {/* table */}
+        <div className="w-full md:w-2/3">
           <div className="bg-white rounded-xl shadow p-4">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold">Users</h2>
@@ -171,25 +150,24 @@ function App() {
                       <td className="py-2 pr-3">{u.full_name}</td>
                       <td className="py-2 pr-3">{u.email}</td>
                       <td className="py-2 pr-3">
-                        {u.is_active ? (
-                          <span className="px-2 py-1 bg-green-100 text-green-600 rounded-full text-xs">
-                            yes
-                          </span>
-                        ) : (
-                          <span className="px-2 py-1 bg-red-100 text-red-600 rounded-full text-xs">
-                            no
-                          </span>
-                        )}
+                        {u.is_active ? "yes" : "no"}
                       </td>
                       <td className="py-2 text-right space-x-2">
                         <button
-                          onClick={() => handleEdit(u)}
+                          onClick={() => {
+                            setEditingId(u.id);
+                            setForm({
+                              full_name: u.full_name,
+                              email: u.email,
+                              is_active: u.is_active,
+                            });
+                          }}
                           className="text-xs text-blue-600 hover:underline"
                         >
                           Edit
                         </button>
                         <button
-                          onClick={() => handleDelete(u.id)}
+                          onClick={() => deleteUser(u.id).then(load)}
                           className="text-xs text-red-600 hover:underline"
                         >
                           Del
@@ -199,10 +177,7 @@ function App() {
                   ))}
                   {users.length === 0 && (
                     <tr>
-                      <td
-                        colSpan={5}
-                        className="py-4 text-center text-slate-400"
-                      >
+                      <td colSpan={5} className="py-4 text-center text-slate-400">
                         No users
                       </td>
                     </tr>
@@ -216,5 +191,3 @@ function App() {
     </div>
   );
 }
-
-export default App;
