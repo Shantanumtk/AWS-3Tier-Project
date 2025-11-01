@@ -6,3 +6,4 @@ boto3==1.35.36
 python-dotenv==1.0.1
 pydantic==2.9.2
 email-validator
+asyncio==3.0.3
