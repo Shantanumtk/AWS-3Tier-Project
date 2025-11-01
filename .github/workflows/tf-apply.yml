@@ -9,8 +9,6 @@ on:
 
 env:
   TF_WORKDIR: terraform
-  TF_BUCKET: aws-3tier-tfstate-${{ secrets.AWS_ACCOUNT_ID }}
-  TF_DDB_TABLE: aws-3tier-tflock
   AWS_REGION: ${{ secrets.AWS_REGION || 'us-west-2' }}
 
 jobs:
@@ -31,6 +29,17 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # build unique + valid names AFTER creds
+      - name: Set backend names
+        id: set-backend
+        run: |
+          set -eux
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="aws-3tier-tfstate-${ACCOUNT_ID}"
+          TABLE="aws-3tier-tflock-${ACCOUNT_ID}"
+          echo "TF_BUCKET=${BUCKET}" >> $GITHUB_ENV
+          echo "TF_DDB_TABLE=${TABLE}" >> $GITHUB_ENV
+
       - name: Create S3 bucket if not exists
         run: |
           set -eux
@@ -41,7 +50,9 @@ jobs:
               --bucket "$TF_BUCKET" \
               --region "$AWS_REGION" \
               --create-bucket-configuration LocationConstraint="$AWS_REGION"
-            aws s3api put-bucket-versioning --bucket "$TF_BUCKET" --versioning-configuration Status=Enabled
+            aws s3api put-bucket-versioning \
+              --bucket "$TF_BUCKET" \
+              --versioning-configuration Status=Enabled
           fi
 
       - name: Create DynamoDB table if not exists
@@ -85,5 +96,4 @@ jobs:
         run: |
           echo "---- Terraform output ----"
           terraform output -json || true
-          echo "---- Frontend ALB (if defined in outputs.tf as frontend_alb_dns) ----"
           terraform output frontend_alb_dns || true

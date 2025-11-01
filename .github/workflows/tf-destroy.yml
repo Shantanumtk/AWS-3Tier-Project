@@ -5,9 +5,6 @@ on:
 
 env:
   TF_WORKDIR: terraform
-  TF_BUCKET: aws-3tier-tfstate-${{ secrets.AWS_ACCOUNT_ID }}
-  TF_DDB_TABLE: aws-3tier-tflock
-  TF_STATE_KEY: aws-3tier/terraform.tfstate
   AWS_REGION: ${{ secrets.AWS_REGION || 'us-west-2' }}
 
 jobs:
@@ -25,17 +22,28 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # same naming logic as apply
+      - name: Set backend names
+        id: set-backend
+        run: |
+          set -eux
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="aws-3tier-tfstate-${ACCOUNT_ID}"
+          TABLE="aws-3tier-tflock-${ACCOUNT_ID}"
+          echo "TF_BUCKET=${BUCKET}" >> $GITHUB_ENV
+          echo "TF_DDB_TABLE=${TABLE}" >> $GITHUB_ENV
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.5
 
-      - name: Terraform init (uses remote state)
+      - name: Terraform init
         working-directory: ${{ env.TF_WORKDIR }}
         run: |
           terraform init \
             -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="key=aws-3tier/terraform.tfstate" \
             -backend-config="region=${AWS_REGION}" \
             -backend-config="dynamodb_table=${TF_DDB_TABLE}"
 
@@ -43,32 +51,13 @@ jobs:
         working-directory: ${{ env.TF_WORKDIR }}
         run: terraform destroy -auto-approve
 
-      # --- cleanup part: remove state + backend infra ---
-      - name: Delete state object from S3
+      # delete S3 + DynamoDB AFTER destroy
+      - name: Cleanup backend
         run: |
           set -eux
-          if aws s3api head-object --bucket "$TF_BUCKET" --key "$TF_STATE_KEY" >/dev/null 2>&1; then
-            aws s3api delete-object --bucket "$TF_BUCKET" --key "$TF_STATE_KEY"
-          else
-            echo "No state object $TF_STATE_KEY in $TF_BUCKET"
-          fi
+          aws dynamodb delete-table --table-name "$TF_DDB_TABLE" || true
+          aws dynamodb wait table-not-exists --table-name "$TF_DDB_TABLE" || true
 
-      - name: Delete S3 bucket (if empty)
-        run: |
-          set -eux
-          if aws s3api head-bucket --bucket "$TF_BUCKET" 2>/dev/null; then
-            aws s3 rm "s3://$TF_BUCKET" --recursive || true
-            aws s3api delete-bucket --bucket "$TF_BUCKET" --region "$AWS_REGION" || true
-          else
-            echo "Bucket $TF_BUCKET not found, skipping"
-          fi
-
-      - name: Delete DynamoDB lock table
-        run: |
-          set -eux
-          if aws dynamodb describe-table --table-name "$TF_DDB_TABLE" >/dev/null 2>&1; then
-            aws dynamodb delete-table --table-name "$TF_DDB_TABLE"
-            aws dynamodb wait table-not-exists --table-name "$TF_DDB_TABLE"
-          else
-            echo "Table $TF_DDB_TABLE not found, skipping"
-          fi
+          # delete all objects then delete bucket
+          aws s3 rm "s3://$TF_BUCKET" --recursive || true
+          aws s3api delete-bucket --bucket "$TF_BUCKET" --region "$AWS_REGION" || true
