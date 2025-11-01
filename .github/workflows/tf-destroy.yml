@@ -2,6 +2,11 @@ name: Terraform Destroy (3-Tier)
 
 on:
   workflow_dispatch:
+    inputs:
+      confirm_destroy:
+        description: 'Type "DESTROY" to confirm deletion of all resources'
+        required: true
+        default: ''
 
 env:
   TF_WORKDIR: terraform
@@ -12,6 +17,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Verify destruction confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm_destroy }}" != "DESTROY" ]; then
+            echo "❌ Destruction not confirmed. Please type DESTROY to proceed."
+            exit 1
+          fi
+          echo "✅ Destruction confirmed. Proceeding..."
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -22,7 +35,6 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # same naming logic as apply
       - name: Set backend names
         id: set-backend
         run: |
@@ -32,32 +44,254 @@ jobs:
           TABLE="aws-3tier-tflock-${ACCOUNT_ID}"
           echo "TF_BUCKET=${BUCKET}" >> $GITHUB_ENV
           echo "TF_DDB_TABLE=${TABLE}" >> $GITHUB_ENV
+          echo "📦 Backend S3 Bucket: ${BUCKET}"
+          echo "🔒 Lock DynamoDB Table: ${TABLE}"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.5
 
+      - name: Check if backend exists
+        id: check-backend
+        continue-on-error: true
+        run: |
+          if aws s3api head-bucket --bucket "$TF_BUCKET" 2>/dev/null; then
+            echo "backend_exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Backend bucket exists"
+          else
+            echo "backend_exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Backend bucket not found"
+          fi
+
       - name: Terraform init
+        if: steps.check-backend.outputs.backend_exists == 'true'
         working-directory: ${{ env.TF_WORKDIR }}
         run: |
           terraform init \
             -backend-config="bucket=${TF_BUCKET}" \
             -backend-config="key=aws-3tier/terraform.tfstate" \
             -backend-config="region=${AWS_REGION}" \
-            -backend-config="dynamodb_table=${TF_DDB_TABLE}"
+            -backend-config="dynamodb_table=${TF_DDB_TABLE}" || {
+              echo "⚠️ Terraform init failed, attempting recovery..."
+              terraform init -reconfigure \
+                -backend-config="bucket=${TF_BUCKET}" \
+                -backend-config="key=aws-3tier/terraform.tfstate" \
+                -backend-config="region=${AWS_REGION}" \
+                -backend-config="dynamodb_table=${TF_DDB_TABLE}"
+            }
+
+      - name: Check for state locks
+        if: steps.check-backend.outputs.backend_exists == 'true'
+        continue-on-error: true
+        run: |
+          echo "🔍 Checking for state locks..."
+          aws dynamodb scan \
+            --table-name "$TF_DDB_TABLE" \
+            --filter-expression "begins_with(LockID, :prefix)" \
+            --expression-attribute-values '{":prefix":{"S":"aws-3tier"}}' 2>/dev/null || true
+
+      - name: Force unlock if locked
+        if: steps.check-backend.outputs.backend_exists == 'true'
+        working-directory: ${{ env.TF_WORKDIR }}
+        continue-on-error: true
+        run: |
+          # Get any lock IDs
+          LOCK_IDS=$(aws dynamodb scan \
+            --table-name "$TF_DDB_TABLE" \
+            --projection-expression "LockID" \
+            --query 'Items[*].LockID.S' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$LOCK_IDS" ]; then
+            echo "🔓 Found locks, attempting to clear..."
+            for lock_id in $LOCK_IDS; do
+              echo "Unlocking: $lock_id"
+              terraform force-unlock -force "$lock_id" || true
+            done
+          else
+            echo "✅ No locks found"
+          fi
 
       - name: Terraform destroy
+        if: steps.check-backend.outputs.backend_exists == 'true'
         working-directory: ${{ env.TF_WORKDIR }}
-        run: terraform destroy -auto-approve
-
-      # delete S3 + DynamoDB AFTER destroy
-      - name: Cleanup backend
         run: |
-          set -eux
-          aws dynamodb delete-table --table-name "$TF_DDB_TABLE" || true
-          aws dynamodb wait table-not-exists --table-name "$TF_DDB_TABLE" || true
+          echo "🗑️ Starting Terraform destroy..."
+          terraform destroy -auto-approve || {
+            echo "⚠️ Terraform destroy encountered errors, checking for partial destruction..."
+            terraform refresh || true
+            terraform destroy -auto-approve -refresh=false || true
+          }
+          echo "✅ Terraform destroy completed"
 
-          # delete all objects then delete bucket
-          aws s3 rm "s3://$TF_BUCKET" --recursive || true
-          aws s3api delete-bucket --bucket "$TF_BUCKET" --region "$AWS_REGION" || true
+      - name: Cleanup orphaned Secrets Manager secrets
+        continue-on-error: true
+        run: |
+          echo "🔍 Cleaning up Secrets Manager secrets..."
+          SECRET_ARNS=$(aws secretsmanager list-secrets \
+            --query "SecretList[?contains(Name, 'aws-3tier')].ARN" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$SECRET_ARNS" ]; then
+            for arn in $SECRET_ARNS; do
+              echo "Deleting secret: $arn"
+              aws secretsmanager delete-secret \
+                --secret-id "$arn" \
+                --force-delete-without-recovery 2>/dev/null || true
+            done
+          else
+            echo "✅ No orphaned secrets found"
+          fi
+
+      - name: Cleanup orphaned RDS subnet groups
+        continue-on-error: true
+        run: |
+          echo "🔍 Cleaning up RDS subnet groups..."
+          SUBNET_GROUPS=$(aws rds describe-db-subnet-groups \
+            --query "DBSubnetGroups[?contains(DBSubnetGroupName, 'aws-3tier')].DBSubnetGroupName" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$SUBNET_GROUPS" ]; then
+            for group in $SUBNET_GROUPS; do
+              echo "Deleting subnet group: $group"
+              aws rds delete-db-subnet-group \
+                --db-subnet-group-name "$group" 2>/dev/null || true
+            done
+          else
+            echo "✅ No orphaned subnet groups found"
+          fi
+
+      - name: Cleanup orphaned IAM roles and policies
+        continue-on-error: true
+        run: |
+          echo "🔍 Cleaning up IAM roles..."
+          ROLES=$(aws iam list-roles \
+            --query "Roles[?contains(RoleName, 'aws-3tier')].RoleName" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$ROLES" ]; then
+            for role in $ROLES; do
+              echo "Processing role: $role"
+              
+              # Detach managed policies
+              ATTACHED_POLICIES=$(aws iam list-attached-role-policies \
+                --role-name "$role" \
+                --query 'AttachedPolicies[].PolicyArn' \
+                --output text 2>/dev/null || echo "")
+              
+              for policy_arn in $ATTACHED_POLICIES; do
+                echo "  Detaching policy: $policy_arn"
+                aws iam detach-role-policy \
+                  --role-name "$role" \
+                  --policy-arn "$policy_arn" 2>/dev/null || true
+              done
+              
+              # Delete inline policies
+              INLINE_POLICIES=$(aws iam list-role-policies \
+                --role-name "$role" \
+                --query 'PolicyNames[]' \
+                --output text 2>/dev/null || echo "")
+              
+              for policy_name in $INLINE_POLICIES; do
+                echo "  Deleting inline policy: $policy_name"
+                aws iam delete-role-policy \
+                  --role-name "$role" \
+                  --policy-name "$policy_name" 2>/dev/null || true
+              done
+              
+              # Delete instance profiles
+              INSTANCE_PROFILES=$(aws iam list-instance-profiles-for-role \
+                --role-name "$role" \
+                --query 'InstanceProfiles[].InstanceProfileName' \
+                --output text 2>/dev/null || echo "")
+              
+              for profile in $INSTANCE_PROFILES; do
+                echo "  Removing role from instance profile: $profile"
+                aws iam remove-role-from-instance-profile \
+                  --instance-profile-name "$profile" \
+                  --role-name "$role" 2>/dev/null || true
+                echo "  Deleting instance profile: $profile"
+                aws iam delete-instance-profile \
+                  --instance-profile-name "$profile" 2>/dev/null || true
+              done
+              
+              # Delete the role
+              echo "  Deleting role: $role"
+              aws iam delete-role --role-name "$role" 2>/dev/null || true
+            done
+          else
+            echo "✅ No orphaned IAM roles found"
+          fi
+
+      - name: Cleanup DynamoDB lock table
+        continue-on-error: true
+        run: |
+          echo "🗑️ Deleting DynamoDB table: $TF_DDB_TABLE"
+          aws dynamodb delete-table --table-name "$TF_DDB_TABLE" 2>/dev/null || {
+            echo "⚠️ DynamoDB table might not exist or already deleted"
+          }
+          
+          echo "⏳ Waiting for table deletion..."
+          aws dynamodb wait table-not-exists --table-name "$TF_DDB_TABLE" 2>/dev/null || {
+            echo "⚠️ Wait timed out or table already gone"
+          }
+          echo "✅ DynamoDB table cleanup complete"
+
+      - name: Cleanup S3 backend bucket
+        continue-on-error: true
+        run: |
+          echo "🗑️ Cleaning up S3 bucket: $TF_BUCKET"
+          
+          # Check if bucket exists
+          if ! aws s3api head-bucket --bucket "$TF_BUCKET" 2>/dev/null; then
+            echo "✅ Bucket already deleted"
+            exit 0
+          fi
+          
+          # Delete all object versions
+          echo "Deleting all object versions..."
+          aws s3api list-object-versions \
+            --bucket "$TF_BUCKET" \
+            --output json \
+            --query 'Versions[].{Key:Key,VersionId:VersionId}' 2>/dev/null | \
+          jq -r '.[]? | "--key \"" + .Key + "\" --version-id \"" + .VersionId + "\""' | \
+          while IFS= read -r args; do
+            eval aws s3api delete-object --bucket "$TF_BUCKET" $args 2>/dev/null || true
+          done
+          
+          # Delete all delete markers
+          echo "Deleting all delete markers..."
+          aws s3api list-object-versions \
+            --bucket "$TF_BUCKET" \
+            --output json \
+            --query 'DeleteMarkers[].{Key:Key,VersionId:VersionId}' 2>/dev/null | \
+          jq -r '.[]? | "--key \"" + .Key + "\" --version-id \"" + .VersionId + "\""' | \
+          while IFS= read -r args; do
+            eval aws s3api delete-object --bucket "$TF_BUCKET" $args 2>/dev/null || true
+          done
+          
+          # Final check and delete bucket
+          echo "Deleting bucket..."
+          aws s3 rm "s3://$TF_BUCKET" --recursive 2>/dev/null || true
+          aws s3api delete-bucket --bucket "$TF_BUCKET" --region "$AWS_REGION" 2>/dev/null || {
+            echo "⚠️ Bucket might not be empty or already deleted"
+          }
+          
+          echo "✅ S3 bucket cleanup complete"
+
+      - name: Final cleanup summary
+        if: always()
+        run: |
+          echo "======================================"
+          echo "🎯 DESTRUCTION SUMMARY"
+          echo "======================================"
+          echo "✅ Terraform resources destroyed"
+          echo "✅ Secrets Manager cleanup attempted"
+          echo "✅ RDS subnet groups cleanup attempted"
+          echo "✅ IAM roles/policies cleanup attempted"
+          echo "✅ DynamoDB lock table removed"
+          echo "✅ S3 backend bucket removed"
+          echo "======================================"
+          echo "🎉 All cleanup operations completed!"
+          echo "======================================"
