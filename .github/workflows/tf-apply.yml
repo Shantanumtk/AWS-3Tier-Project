@@ -9,7 +9,7 @@ on:
 
 env:
   TF_WORKDIR: terraform
-  TF_BUCKET: aws-3tier-tfstate
+  TF_BUCKET: aws-3tier-tfstate-${{ secrets.AWS_ACCOUNT_ID }}
   TF_DDB_TABLE: aws-3tier-tflock
   AWS_REGION: ${{ secrets.AWS_REGION || 'us-west-2' }}
 

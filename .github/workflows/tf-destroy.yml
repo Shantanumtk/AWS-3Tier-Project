@@ -5,8 +5,9 @@ on:
 
 env:
   TF_WORKDIR: terraform
-  TF_BUCKET: aws-3tier-tfstate
+  TF_BUCKET: aws-3tier-tfstate-${{ secrets.AWS_ACCOUNT_ID }}
   TF_DDB_TABLE: aws-3tier-tflock
+  TF_STATE_KEY: aws-3tier/terraform.tfstate
   AWS_REGION: ${{ secrets.AWS_REGION || 'us-west-2' }}
 
 jobs:
@@ -29,15 +30,45 @@ jobs:
         with:
           terraform_version: 1.9.5
 
-      - name: Terraform init
+      - name: Terraform init (uses remote state)
         working-directory: ${{ env.TF_WORKDIR }}
         run: |
           terraform init \
             -backend-config="bucket=${TF_BUCKET}" \
-            -backend-config="key=aws-3tier/terraform.tfstate" \
+            -backend-config="key=${TF_STATE_KEY}" \
             -backend-config="region=${AWS_REGION}" \
             -backend-config="dynamodb_table=${TF_DDB_TABLE}"
 
       - name: Terraform destroy
         working-directory: ${{ env.TF_WORKDIR }}
         run: terraform destroy -auto-approve
+
+      # --- cleanup part: remove state + backend infra ---
+      - name: Delete state object from S3
+        run: |
+          set -eux
+          if aws s3api head-object --bucket "$TF_BUCKET" --key "$TF_STATE_KEY" >/dev/null 2>&1; then
+            aws s3api delete-object --bucket "$TF_BUCKET" --key "$TF_STATE_KEY"
+          else
+            echo "No state object $TF_STATE_KEY in $TF_BUCKET"
+          fi
+
+      - name: Delete S3 bucket (if empty)
+        run: |
+          set -eux
+          if aws s3api head-bucket --bucket "$TF_BUCKET" 2>/dev/null; then
+            aws s3 rm "s3://$TF_BUCKET" --recursive || true
+            aws s3api delete-bucket --bucket "$TF_BUCKET" --region "$AWS_REGION" || true
+          else
+            echo "Bucket $TF_BUCKET not found, skipping"
+          fi
+
+      - name: Delete DynamoDB lock table
+        run: |
+          set -eux
+          if aws dynamodb describe-table --table-name "$TF_DDB_TABLE" >/dev/null 2>&1; then
+            aws dynamodb delete-table --table-name "$TF_DDB_TABLE"
+            aws dynamodb wait table-not-exists --table-name "$TF_DDB_TABLE"
+          else
+            echo "Table $TF_DDB_TABLE not found, skipping"
+          fi
