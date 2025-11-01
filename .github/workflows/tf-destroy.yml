@@ -1,0 +1,43 @@
+name: Terraform Destroy (3-Tier)
+
+on:
+  workflow_dispatch:
+
+env:
+  TF_WORKDIR: terraform
+  TF_BUCKET: aws-3tier-tfstate
+  TF_DDB_TABLE: aws-3tier-tflock
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-west-2' }}
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS creds
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${TF_BUCKET}" \
+            -backend-config="key=aws-3tier/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="dynamodb_table=${TF_DDB_TABLE}"
+
+      - name: Terraform destroy
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform destroy -auto-approve
