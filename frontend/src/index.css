@@ -6,3 +6,9 @@
 body {
   @apply bg-slate-100;
 }
+body {
+  background: #e2e8f0;
+}
+table {
+  border-spacing: 0;
+}

@@ -1,4 +1,3 @@
-// frontend/src/api.js
 const API_BASE =
   (window.__APP_CONFIG__ && window.__APP_CONFIG__.API_BASE) || "/api";
 
@@ -29,9 +28,7 @@ export async function updateUser(id, user) {
 }
 
 export async function deleteUser(id) {
-  const res = await fetch(`${API_BASE}/users/${id}`, {
-    method: "DELETE",
-  });
+  const res = await fetch(`${API_BASE}/users/${id}`, { method: "DELETE" });
   if (!res.ok) throw new Error("Failed to delete user");
   return true;
 }
